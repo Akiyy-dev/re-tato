@@ -17,6 +17,7 @@ from telethon.tl.functions import PingRequest
 from .capture import load_schema
 from .client import TatoConnection, safe_error
 from .events import PeerCache, normalize_updates
+from .filters import CaptureFilter, FilterManager
 from .ingest import DeliveryResult, deliver
 from .live_wire import RawTatoUpdates, TatoUpdatesRegistry
 from .session_store import load_session
@@ -40,13 +41,14 @@ def write_status(path, state):
 
 
 class PacketProcessor:
-    def __init__(self, store, account_id):
+    def __init__(self, store, account_id, *, filters=None):
         self.store, self.account_id = store, account_id
+        self.filters = filters
         self.schema, self.peers = load_schema(), PeerCache()
         self.working_cursor = store.get_checkpoint()
         self.attempted = set()
         self.gaps = set()
-        self.stats = {'decoded_packets': 0, 'decode_errors': {}, 'unknown_constructors': {}}
+        self.stats = {'decoded_packets': 0, 'decode_errors': {}, 'unknown_constructors': {}, 'filter_skipped': 0}
 
     def process(self, packet_id, raw):
         self.attempted.add(packet_id)
@@ -88,7 +90,10 @@ class PacketProcessor:
                 events = normalize_updates(parsed, self.account_id, self.peers)
                 candidate, gaps = advance(cursor, parsed) if cursor is not None else (None, set())
                 self.gaps.update(gaps)
-            self.store.commit_packet(packet_id, events, candidate)
+            policy = self.filters.current() if self.filters is not None else CaptureFilter()
+            selected = [event for event in events if policy.allows(event)]
+            self.store.commit_packet(packet_id, selected, candidate)
+            self.stats['filter_skipped'] += len(events) - len(selected)
             self.working_cursor = merge_cursors(cursor, candidate)
             self.stats['decoded_packets'] += 1
             return True
@@ -162,7 +167,7 @@ async def _pause(stop, seconds):
         pass
 
 
-async def delivery_loop(store, config_path, state, stop):
+async def delivery_loop(store, config_path, state, stop, filters=None):
     config, signature = None, None
     next_check = 0
     while not stop.is_set():
@@ -181,7 +186,9 @@ async def delivery_loop(store, config_path, state, stop):
                 config = None
                 state['http_configured'] = False
                 state['http_config_error'] = 'configuration_unavailable'
-        item = store.next_delivery(time.time()) if config is not None else None
+        policy = filters.current() if filters is not None else CaptureFilter()
+        accepts = policy.allows if policy.enabled else None
+        item = store.next_delivery(time.time(), accepts=accepts) if config is not None else None
         if item is None:
             await _pause(stop, 0.5)
             continue
@@ -375,7 +382,8 @@ async def run(args):
     with instance_lock(args.database.parent / 'collector.lock'):
         args.stop_file.unlink(missing_ok=True)
         store = Store(args.database, checkpoint_merger=merge_cursors)
-        processor = PacketProcessor(store, session['user_id'])
+        filters = FilterManager(args.capture_filter)
+        processor = PacketProcessor(store, session['user_id'], filters=filters)
         try:
             # Import prior diagnostic samples once by content hash. They include
             # the user's real reception test; no synthetic event is sent.
@@ -384,7 +392,7 @@ async def run(args):
                 for path in sorted(args.samples.glob('*.dpapi')):
                     store.put_wire(log.read(path))
             processor.replay()
-            tasks.append(asyncio.create_task(delivery_loop(store, args.config, state, stop)))
+            tasks.append(asyncio.create_task(delivery_loop(store, args.config, state, stop, filters)))
             if not args.drain_only:
                 tasks.append(asyncio.create_task(connection_loop(args, store, processor, state, stop)))
             end = time.monotonic() + args.seconds if args.seconds else None
@@ -394,10 +402,13 @@ async def run(args):
                         task.result()
                         raise RuntimeError('collector_worker_stopped')
                 state.update(processor.stats)
-                state['counts'] = store.counts()
+                policy = filters.current()
+                state['capture_filter'] = filters.status()
+                state['counts'] = store.counts(accepts=policy.allows if policy.enabled else None)
+                state['counts'].setdefault('filter_held', 0)
                 state['recovery_required'] = sorted(processor.gaps)
                 write_status(args.status, state)
-                if args.drain_only and not state['counts']['pending']:
+                if args.drain_only and state['counts']['pending'] == state['counts']['filter_held']:
                     break
                 await asyncio.sleep(0.5)
         finally:
@@ -407,7 +418,11 @@ async def run(args):
             if len(tasks) > 1:
                 tasks[1].cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            state.update(running=False, connected=False, counts=store.counts(), **processor.stats)
+            policy = filters.current()
+            state.update(running=False, connected=False,
+                         counts=store.counts(accepts=policy.allows if policy.enabled else None), **processor.stats)
+            state['counts'].setdefault('filter_held', 0)
+            state['capture_filter'] = filters.status()
             state['recovery_required'] = sorted(processor.gaps)
             write_status(args.status, state)
             store.close()
@@ -423,6 +438,8 @@ def main(argv=None):
     parser.add_argument('--profile', type=Path, default=Path('config/client-profile.local.json'))
     parser.add_argument('--public-key', type=Path, default=Path('research/android-static/embedded-public-0.pem'))
     parser.add_argument('--config', type=Path, default=Path('config/collector.local.json'))
+    parser.add_argument('--capture-filter', type=Path, default=Path('config/capture-filter.local.json'),
+                        help='Local group selection; absent configuration preserves all-chat capture')
     parser.add_argument('--database', type=Path, default=Path('.data/collector.sqlite3'))
     parser.add_argument('--samples', type=Path, default=Path('.data/wire'))
     parser.add_argument('--status', type=Path, default=Path('.data/collector-status.json'))
