@@ -307,15 +307,23 @@ class Store:
             protected = _seal_object(checkpoint)
             self._conn.execute('INSERT INTO checkpoints VALUES (1,0,?)', (protected,))
 
-    def next_delivery(self, now: float) -> tuple[str, dict, int] | None:
+    def next_delivery(self, now: float, *, accepts=None) -> tuple[str, dict, int] | None:
         now = _number(now, 'now')
-        row = self._conn.execute('''
-            SELECT event_key,protected_payload,attempts FROM events
+        if accepts is not None and not callable(accepts):
+            raise ValueError('Delivery filter must be callable or null')
+        rows = self._conn.execute('''
+            SELECT event_key,protected_payload,attempts,protected_event FROM events
             WHERE state='pending' AND next_attempt<=?
                 AND NOT EXISTS (SELECT 1 FROM events WHERE state='auth_error')
-            ORDER BY id LIMIT 1
-        ''', (now,)).fetchone()
-        return (row[0], _open_object(row[1]), row[2]) if row is not None else None
+            ORDER BY id
+        ''' + (' LIMIT 1' if accepts is None else ''), (now,))
+        # Check the encrypted event identity, preserving both the frozen payload
+        # and delivery state for excluded old pending items. An excluded first
+        # row must not prevent a later selected message from being sent.
+        for row in rows:
+            if accepts is None or accepts(_open_object(row[3])):
+                return row[0], _open_object(row[1]), row[2]
+        return None
 
     def record_delivery(self, event_key: str, result: DeliveryResult, now: float) -> None:
         now = _number(now, 'now')
@@ -358,7 +366,7 @@ class Store:
         with self._transaction():
             self._conn.execute("UPDATE events SET state='pending',next_attempt=0 WHERE state='auth_error'")
 
-    def counts(self) -> dict:
+    def counts(self, *, accepts=None) -> dict:
         names = ('captured', 'pending', 'delivered', 'rejected', 'no_text', 'undecoded', 'auth_error')
         row = self._conn.execute('''
             SELECT (SELECT COUNT(*) FROM events),
@@ -369,7 +377,13 @@ class Store:
                 (SELECT COUNT(*) FROM wires WHERE state!='processed'),
                 (SELECT COUNT(*) FROM events WHERE state='auth_error')
         ''').fetchone()
-        return dict(zip(names, row))
+        counts = dict(zip(names, row))
+        if accepts is not None:
+            if not callable(accepts):
+                raise ValueError('Delivery filter must be callable or null')
+            pending = self._conn.execute("SELECT protected_event FROM events WHERE state='pending'")
+            counts['filter_held'] = sum(not accepts(_open_object(item[0])) for item in pending)
+        return counts
 
     def close(self) -> None:
         if not self._closed:

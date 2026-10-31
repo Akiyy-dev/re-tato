@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "include": [
+    {"chat_type": "group", "chat_id": 12345},
+    {"chat_type": "channel", "chat_id": 67890}
+  ]
+}
