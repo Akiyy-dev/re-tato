@@ -1,0 +1,4 @@
+# Dependencies for obfuscated diagnostics and interactive login verification.
+pycryptodome==3.23.0
+Telethon==1.45.0
+Pillow==12.0.0

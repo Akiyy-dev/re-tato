@@ -1,0 +1,42 @@
+# Local authentication, configuration, captured messages and runtime records.
+/sessions/
+/.data/
+/config/*
+!/config/*.example.json
+*.local.json
+*.dpapi
+*.session
+*.session-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.log
+.env
+.env.*
+
+# Installed dependencies and generated files.
+/.tools/
+/.venv/
+/venv/
+/.publish/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp
+
+# Static-analysis samples, dumps and machine-specific research records.
+/research/*
+!/research/*-schema.tl
+!/research/android-static/
+/research/android-static/*
+!/research/android-static/embedded-public-0.pem
+*.apk
+*.exe
+*.dll
+*.dmp
+*.pcap
+*.pcapng
+*.zip
+/docs/progress.md
+/docs/superpowers/
