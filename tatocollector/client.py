@@ -66,6 +66,27 @@ class TatoConnection:
         self.sender = None
         self._original_keys = None
         self._gzip = None
+        self._disconnect_future = None
+        self._disconnect_error = None
+
+    def _observe_disconnect(self):
+        # The public property returns a shielded Future. Own exactly one for
+        # this connection, and retrieve its exception even during idle periods.
+        if self.sender is not None and self._disconnect_future is None:
+            self._disconnect_future = self.sender.disconnected
+            self._disconnect_future.add_done_callback(self._record_disconnect)
+
+    def _record_disconnect(self, future):
+        if not future.cancelled():
+            self._disconnect_error = future.exception()
+
+    def check_connected(self):
+        if self._disconnect_future is not None and self._disconnect_future.done():
+            self._record_disconnect(self._disconnect_future)
+        if self._disconnect_error is not None:
+            raise self._disconnect_error
+        if self.sender is None or not self.sender.is_connected():
+            raise ConnectionError('transport_disconnected')
 
     async def __aenter__(self):
         self._original_keys = rsa._server_keys.copy()
@@ -81,12 +102,14 @@ class TatoConnection:
             self._gzip.__enter__()
             await asyncio.wait_for(self.sender.connect(
                 BoundedConnection(self.host, self.port, self.dc_id, loggers=loggers)), timeout=25)
+            self._observe_disconnect()
         except BaseException:
             await self.__aexit__(None, None, None)
             raise
         return self
 
     async def call(self, wire, decoder=bytes, *, timeout=20):
+        self.check_connected()
         request = RawRequest(wrap_init(wire, self.profile), decoder)
         return await asyncio.wait_for(self.sender.send(request), timeout=timeout)
 
@@ -103,8 +126,12 @@ class TatoConnection:
     async def __aexit__(self, *_):
         try:
             if self.sender is not None:
+                # Failed setup can also leave an exceptional sender Future.
+                self._observe_disconnect()
                 await self.sender.disconnect()
         finally:
+            if self._disconnect_future is not None and self._disconnect_future.done():
+                self._record_disconnect(self._disconnect_future)
             try:
                 if self._original_keys is not None:
                     rsa._server_keys.clear()
@@ -118,6 +145,11 @@ class TatoConnection:
 
 def safe_error(exc):
     error = {'error_type': type(exc).__name__}
+    if isinstance(exc, OSError):
+        for name in ('errno', 'winerror'):
+            value = getattr(exc, name, None)
+            if type(value) is int:
+                error[name] = value
     if isinstance(exc, AuthProtocolError):
         error.update(exc.diagnostic)
     if hasattr(exc, 'code'):

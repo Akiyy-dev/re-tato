@@ -54,6 +54,8 @@ Copy-Item config/client-profile.example.json config/client-profile.local.json
 
 ## 当前限制
 
+网络中断时，Windows 可能报告 `ConnectionResetError`／`WinError 64`。采集器会记录断线类型和数值错误码，并按现有退避策略重新连接及差量恢复；该错误本身不表示账号会话失效。新版显式处理底层断线 Future，避免额外出现 `Future exception was never retrieved` 警告。是否已经恢复，以状态文件最新的 `connected`、`connection_error`、`updated_at` 和投递回执为准。
+
 部分自定义媒体、网页即时预览 `Page` 和私密聊天加密动作尚未完全适配。服务端返回 `DifferenceTooLong` 时保留原始数据和未解决缺口，暂不提供完整历史重建。不能保证所有特殊消息结构均已覆盖。
 
 图形校验必须人工完成；网页式验证码及两步验证密码尚未适配。会话和队列受 Windows 当前用户 DPAPI 保护，不能直接搬到另一个用户使用。
