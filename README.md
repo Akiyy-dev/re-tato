@@ -15,6 +15,8 @@ Copy-Item config/client-profile.example.json config/client-profile.local.json
 
 编辑 `config/client-profile.local.json`，填入自己有权使用、与目标服务兼容的应用参数。示例中的 `api_id`、`api_hash` 和 `app_version` 是占位值，不能直接登录。本项目不提供应用凭据。
 
+当前默认连接入口为 `15.197.179.83:20334`，已核验其加密握手与固定服务端公钥匹配。旧会话或登录检查点中的 `15.197.252.89:20334` 会在连接时改用当前入口，保留原有认证材料和同步参数，无需删除会话或消息队列。其他显式地址和端口保持原样；目前不支持自动发现节点。
+
 1. 双击 `run-login.cmd`，在本机输入邮箱，手动完成图形校验，再输入验证码。
 2. 指定自己的 HTTP 地址并配置消息接入来源的 `tgfi_` Token：
 

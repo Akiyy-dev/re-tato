@@ -19,6 +19,10 @@ from .keyexchange import (BoundedConnection, EXPECTED_FINGERPRINT,
                           to_pkcs1_public_key, verify_public_key)
 
 
+_SERVICE_HOST = '15.197.179.83'
+_SERVICE_PORT = 20334
+
+
 _PUBLIC_RPC_ERRORS = frozenset({
     'BAD_REQUEST', 'UNAUTHORIZED', 'FORBIDDEN', 'NOT_FOUND', 'INTERNAL', 'FLOOD',
     'AUTH_KEY_UNREGISTERED', 'AUTH_KEY_DUPLICATED', 'SESSION_REVOKED', 'SESSION_EXPIRED',
@@ -54,11 +58,15 @@ class RawRequest(TLRequest):
 
 
 class TatoConnection:
-    def __init__(self, profile, public_key, *, host='15.197.252.89', port=20334,
+    def __init__(self, profile, public_key, *, host=_SERVICE_HOST, port=_SERVICE_PORT,
                  dc_id=1, auth_key=None, time_offset=0, updates_queue=None):
         verify_public_key(public_key, EXPECTED_FINGERPRINT)
         self.profile = profile
         self.public_key = public_key
+        # Old sessions/checkpoints retain the retired endpoint. Migrate only
+        # this verified replacement; keep credentials and custom endpoints.
+        if (host, port) == ('15.197.252.89', 20334):
+            host, port = _SERVICE_HOST, _SERVICE_PORT
         self.host, self.port, self.dc_id = host, port, dc_id
         self.time_offset = time_offset
         self.auth_key = auth_key
