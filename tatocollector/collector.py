@@ -354,8 +354,7 @@ async def connection_loop(args, store, processor, state, stop):
                                 for gap in processor.gaps:
                                     if gap.startswith('channel:'):
                                         channel_due[gap.split(':')[1]] = 0
-                            if not connection.sender.is_connected():
-                                raise ConnectionError('transport_disconnected')
+                            connection.check_connected()
                             if time.monotonic() >= next_ping:
                                 await asyncio.wait_for(connection.sender.send(PingRequest(1)), 10)
                                 next_ping = time.monotonic() + 25
