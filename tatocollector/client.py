@@ -37,6 +37,16 @@ _PUBLIC_RPC_ERRORS = frozenset({
 })
 
 
+class EndpointDiscoveryError(ConnectionError):
+    def __init__(self, reason_code, attempts):
+        if reason_code not in {'endpoint_discovery_failed', 'endpoint_discovery_timed_out'}:
+            raise ValueError('invalid discovery reason')
+        if type(attempts) is not int or not 0 <= attempts <= 4:
+            raise ValueError('invalid discovery attempt count')
+        super().__init__(reason_code)
+        self.reason_code, self.attempts = reason_code, attempts
+
+
 class RawRequest(TLRequest):
     SUBCLASS_OF_ID = 0
 
@@ -153,6 +163,8 @@ class TatoConnection:
 
 def safe_error(exc):
     error = {'error_type': type(exc).__name__}
+    if isinstance(exc, EndpointDiscoveryError):
+        error.update(reason_code=exc.reason_code, connection_attempts=exc.attempts)
     if isinstance(exc, OSError):
         for name in ('errno', 'winerror'):
             value = getattr(exc, name, None)

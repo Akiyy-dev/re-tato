@@ -15,7 +15,8 @@ import time
 from telethon.tl.functions import PingRequest
 
 from .capture import load_schema
-from .client import TatoConnection, safe_error
+from .automatic import AutomaticConnection as TatoConnection
+from .client import safe_error
 from .events import PeerCache, normalize_updates
 from .filters import CaptureFilter, FilterManager
 from .ingest import DeliveryResult, deliver
@@ -319,8 +320,10 @@ async def connection_loop(args, store, processor, state, stop):
                         if store.get_checkpoint() is None:
                             store.set_initial_checkpoint({key: baseline[key] for key in ('pts', 'qts', 'seq', 'date')}
                                                          | {'channels': {}, 'captured_since': baseline['date']})
-                        state.update(connected=True, session_verified=True, connection_error=None)
-                        print('Tatotalk 已连接；独立采集和 HTTP 队列正在运行。', flush=True)
+                        state.update(connected=True, session_verified=True, connection_error=None,
+                                     connection_endpoint=connection.endpoint_status.copy())
+                        print(f'Tatotalk 已连接（{connection.host}:{connection.port}）；'
+                              '独立采集和 HTTP 队列正在运行。', flush=True)
                         delay, next_ping, next_recovery = 1, time.monotonic() + 25, 0
                         next_dialogs, channel_due = 0, {}
                         while not stop.is_set():

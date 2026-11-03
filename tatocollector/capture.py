@@ -11,7 +11,8 @@ import time
 
 from telethon.tl.functions import PingRequest
 
-from .client import TatoConnection, safe_error
+from .automatic import AutomaticConnection as TatoConnection
+from .client import safe_error
 from .events import PeerCache, normalize_updates
 from .live_wire import RawTatoUpdates, TatoUpdatesRegistry
 from .session_store import load_session
