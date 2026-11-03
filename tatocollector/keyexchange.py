@@ -109,9 +109,11 @@ async def verify_key_exchange(host, port, public_key: bytes, *, timeout=15):
     except Exception as exc:
         result.update(error_type=type(exc).__name__, error=str(exc) or 'handshake did not finish before deadline')
     finally:
-        await connection.disconnect()
-        rsa._server_keys.clear()
-        rsa._server_keys.update(original_keys)
+        try:
+            await connection.disconnect()
+        finally:
+            rsa._server_keys.clear()
+            rsa._server_keys.update(original_keys)
     result['elapsed_seconds'] = round(time.monotonic() - start, 3)
     return result
 
