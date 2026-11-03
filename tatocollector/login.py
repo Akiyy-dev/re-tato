@@ -12,7 +12,8 @@ import sys
 import time
 
 from .authwire import encode_email_code_request, parse_sent_code as parse_sent_code_wire, parse_self_user
-from .client import TatoConnection, safe_error
+from .automatic import AutomaticConnection as TatoConnection
+from .client import safe_error
 from .login_recovery import promote_pending, submit_email_signin
 from .pending_login import load_pending
 from .session_store import save_session
@@ -111,6 +112,7 @@ async def run_login(args):
         return 2
     set_phase(args, 'connecting')
     async with TatoConnection(profile, public_key) as connection:
+        print(f'连接入口: {connection.host}:{connection.port}')
         print('独立加密连接已建立。正在请求登录验证码……')
         set_phase(args, 'request_email_code')
         response = await connection.call(encode_email_code_request(email, profile['api_id'], profile['api_hash']), parse_sent_code)

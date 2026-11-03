@@ -20,7 +20,7 @@ def persist_selection(model, path, *, enabled=True):
 
 async def read_catalog(args):
     from .capture import load_schema
-    from .client import TatoConnection
+    from .automatic import AutomaticConnection as TatoConnection
     from .live_wire import TatoUpdatesRegistry
     from .session_store import load_session
 
