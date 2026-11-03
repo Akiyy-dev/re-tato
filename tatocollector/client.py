@@ -15,6 +15,7 @@ from telethon.tl.tlobject import TLRequest
 
 from .authwire import AuthProtocolError, wrap_init
 from .compression import BoundedGzip
+from .health import HealthCheckError
 from .keyexchange import (BoundedConnection, EXPECTED_FINGERPRINT,
                           to_pkcs1_public_key, verify_public_key)
 
@@ -163,6 +164,8 @@ class TatoConnection:
 
 def safe_error(exc):
     error = {'error_type': type(exc).__name__}
+    if isinstance(exc, HealthCheckError):
+        error['reason_code'] = exc.reason_code
     if isinstance(exc, EndpointDiscoveryError):
         error.update(reason_code=exc.reason_code, connection_attempts=exc.attempts)
     if isinstance(exc, OSError):

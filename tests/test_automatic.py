@@ -88,6 +88,17 @@ class AutomaticConnectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((connection.host, connection.port), ('1.1.1.1', 443))
                 self.assertEqual(connection.endpoint_status['source'], 'bootstrap_tcp')
 
+    async def test_failed_business_health_does_not_pin_reconnect_to_the_same_endpoint(self):
+        from tatocollector.discovery import Endpoint
+        from tatocollector.health import HealthCheckError
+        with self.offline_sources(native=[Endpoint('8.8.8.8', 20334, 'native')]) as attempts:
+            with self.assertRaises(HealthCheckError):
+                async with self.connection():
+                    raise HealthCheckError('connection_health_timeout')
+            async with self.connection() as connection:
+                self.assertEqual(connection.host, '9.9.9.9')
+        self.assertEqual(attempts, [('8.8.8.8', 20334), ('9.9.9.9', 20334)])
+
     async def test_working_saved_session_is_not_starved_by_a_long_bootstrap_list(self):
         from tatocollector.discovery import Endpoint, EndpointCache
         EndpointCache(self.cache).write([Endpoint('8.8.4.4', 443, 'cache')])

@@ -51,6 +51,13 @@ class AutomaticConnection(TatoConnection):
         except asyncio.TimeoutError:
             raise EndpointDiscoveryError('endpoint_discovery_timed_out', self._attempts) from None
 
+    async def __aexit__(self, exc_type, exc, traceback):
+        if isinstance(exc, OSError):
+            # A connected socket can still fail its business health check.
+            # Let the next bounded reconnect consider other destinations.
+            self._failed(Endpoint(self.host, self.port, 'session'))
+        return await super().__aexit__(exc_type, exc, traceback)
+
     async def _connect_automatically(self):
         native = await asyncio.to_thread(native_endpoints)
         cached = [Endpoint(item.host, item.port, 'cache') for item in self._cache.read()]

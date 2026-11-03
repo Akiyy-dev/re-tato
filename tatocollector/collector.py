@@ -7,12 +7,11 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import struct
 import time
-
-from telethon.tl.functions import PingRequest
 
 from .capture import load_schema
 from .automatic import AutomaticConnection as TatoConnection
@@ -20,6 +19,7 @@ from .client import safe_error
 from .events import PeerCache, normalize_updates
 from .filters import CaptureFilter, FilterManager
 from .ingest import DeliveryResult, deliver
+from .health import health_loop, supervise_connection
 from .live_wire import RawTatoUpdates, TatoUpdatesRegistry
 from .session_store import load_session
 from .settings import load_ingest_config
@@ -49,6 +49,7 @@ class PacketProcessor:
         self.working_cursor = store.get_checkpoint()
         self.attempted = set()
         self.gaps = set()
+        self.gap_versions = {}
         self.stats = {'decoded_packets': 0, 'decode_errors': {}, 'unknown_constructors': {}, 'filter_skipped': 0}
 
     def process(self, packet_id, raw):
@@ -91,6 +92,8 @@ class PacketProcessor:
                 events = normalize_updates(parsed, self.account_id, self.peers)
                 candidate, gaps = advance(cursor, parsed) if cursor is not None else (None, set())
                 self.gaps.update(gaps)
+                for gap in gaps:
+                    self.gap_versions[gap] = self.gap_versions.get(gap, 0) + 1
             policy = self.filters.current() if self.filters is not None else CaptureFilter()
             selected = [event for event in events if policy.allows(event)]
             self.store.commit_packet(packet_id, selected, candidate)
@@ -113,18 +116,29 @@ class PacketProcessor:
                 unknown[constructor] = unknown.get(constructor, 0) + 1
             return False
 
-    def replay(self):
+    def _replay_packets(self, batch_size):
         # One attempt per packet per process. Restarting after a schema upgrade
         # replays failed bytes; an unknown packet cannot create a busy loop.
         after_id = 0
         while True:
-            batch = self.store.pending_wires(limit=100, after_id=after_id)
+            batch = self.store.pending_wires(limit=batch_size, after_id=after_id)
             if not batch:
                 break
             for packet_id, raw in batch:
                 after_id = packet_id
-                if packet_id not in self.attempted:
-                    self.process(packet_id, raw)
+                yield packet_id, raw
+
+    def replay(self):
+        for packet_id, raw in self._replay_packets(100):
+            if packet_id not in self.attempted:
+                self.process(packet_id, raw)
+
+    async def replay_async(self):
+        for index, (packet_id, raw) in enumerate(self._replay_packets(10), 1):
+            if packet_id not in self.attempted:
+                self.process(packet_id, raw)
+            if index % 10 == 0:
+                await asyncio.sleep(0)
 
 
 class _Diagnostics(logging.Handler):
@@ -202,7 +216,13 @@ async def delivery_loop(store, config_path, state, stop, filters=None):
                               'receipt_id': result.receipt_id, 'reason': result.reason}), flush=True)
 
 
+def _gap_version(processor, scope):
+    versions = getattr(processor, 'gap_versions', {})
+    return versions.get(scope, 0) if isinstance(versions, dict) else 0
+
+
 async def recover_global(connection, processor, state):
+    generation = _gap_version(processor, 'global')
     cursor = processor.store.get_checkpoint()
     if cursor is None:
         return
@@ -218,7 +238,8 @@ async def recover_global(connection, processor, state):
         parsed, _ = processor.schema.decode_prefix(raw, 'updates.Difference')
         _, cursor, more = difference_events(parsed, cursor, processor.account_id, processor.peers)
         if not more:
-            processor.gaps.discard('global')
+            if _gap_version(processor, 'global') == generation:
+                processor.gaps.discard('global')
             state.pop('recovery_error', None)
             state['last_global_recovery'] = datetime.now(timezone.utc).isoformat()
             return
@@ -258,6 +279,8 @@ async def refresh_dialogs(connection, processor, state):
 
 
 async def recover_channel(connection, processor, cid, state):
+    scope = f'channel:{cid}'
+    generation = _gap_version(processor, scope)
     cursor = processor.store.get_checkpoint()
     for _ in range(20):
         entry = cursor.get('channels', {}).get(str(cid))
@@ -275,7 +298,8 @@ async def recover_channel(connection, processor, cid, state):
         parsed = processor.parsed
         _, cursor, more = channel_events(parsed, cursor, cid, processor.account_id, processor.peers)
         if not more:
-            processor.gaps.discard(f'channel:{cid}')
+            if _gap_version(processor, scope) == generation:
+                processor.gaps.discard(scope)
             state.pop('channel_recovery_error', None)
             return max(1, min(parsed.get('timeout', 30), 300))
     state['channel_recovery_error'] = 'channel_difference_slice_limit'
@@ -297,6 +321,74 @@ async def recover_channel_safely(connection, processor, cid, state):
         return timeout
 
 
+async def receive_updates(queue, store, processor, state, stop, schedule):
+    while not stop.is_set():
+        try:
+            update = await asyncio.wait_for(queue.get(), 0.5)
+        except asyncio.TimeoutError:
+            continue
+        try:
+            if not isinstance(update, RawTatoUpdates):
+                continue
+            packet_id = getattr(update, 'sample_path', None) or store.put_wire(update.raw)
+            if packet_id not in processor.attempted:
+                processor.process(packet_id, update.raw)
+                state['last_update_processed_at'] = datetime.now(timezone.utc).isoformat()
+            # Replay may have processed this wire before the queue reaches it.
+            # Deduplicate the event, while retaining its recovery scheduling.
+            for gap in processor.gaps:
+                if gap == 'global':
+                    schedule['global_due'] = min(schedule['global_due'], time.monotonic() + 1)
+                elif gap.startswith('channel:'):
+                    schedule['channel_due'][gap.split(':')[1]] = 0
+        finally:
+            queue.task_done()
+
+
+async def synchronize_updates(connection, processor, state, stop, schedule):
+    next_dialogs = 0
+    while not stop.is_set():
+        if time.monotonic() >= next_dialogs:
+            try:
+                await refresh_dialogs(connection, processor, state)
+            except (ValueError, TLDecodeError):
+                state['dialogs_error'] = 'dialog_baseline_unavailable'
+            next_dialogs = time.monotonic() + 300
+        if stop.is_set():
+            return
+        if time.monotonic() >= schedule['global_due']:
+            generation = _gap_version(processor, 'global')
+            await recover_global(connection, processor, state)
+            schedule['global_due'] = (time.monotonic() + 30
+                                      if _gap_version(processor, 'global') == generation else 0)
+        if stop.is_set():
+            return
+        cursor = processor.store.get_checkpoint()
+        for channel in cursor.get('channels', {}):
+            if time.monotonic() >= schedule['channel_due'].get(channel, 0):
+                scope = f'channel:{channel}'
+                generation = _gap_version(processor, scope)
+                timeout = await recover_channel_safely(connection, processor, int(channel), state)
+                await processor.replay_async()
+                schedule['channel_due'][channel] = (time.monotonic() + timeout
+                    if _gap_version(processor, scope) == generation else 0)
+                if stop.is_set():
+                    break
+        connection.check_connected()
+        await _pause(stop, 0.5)
+
+
+async def run_connected(connection, queue, store, processor, state, stop, *,
+                        health_interval=30, health_timeout=10):
+    schedule = {'global_due': 0.0, 'channel_due': {}}
+    await supervise_connection([
+        health_loop(connection, processor.schema, state, stop,
+                    interval=health_interval, timeout=health_timeout),
+        receive_updates(queue, store, processor, state, stop, schedule),
+        synchronize_updates(connection, processor, state, stop, schedule),
+    ], stop)
+
+
 async def connection_loop(args, store, processor, state, stop):
     session = load_session(args.session)
     profile = json.loads(args.profile.read_text(encoding='utf-8'))
@@ -316,7 +408,7 @@ async def connection_loop(args, store, processor, state, stop):
                                               time_offset=session['time_offset'], updates_queue=queue) as connection:
                         raw_state = await connection.call(struct.pack('<I', 0xEDD4882A))
                         baseline, _ = processor.schema.decode_prefix(raw_state, 'updates.State')
-                        processor.replay()
+                        await processor.replay_async()
                         if store.get_checkpoint() is None:
                             store.set_initial_checkpoint({key: baseline[key] for key in ('pts', 'qts', 'seq', 'date')}
                                                          | {'channels': {}, 'captured_since': baseline['date']})
@@ -324,43 +416,10 @@ async def connection_loop(args, store, processor, state, stop):
                                      connection_endpoint=connection.endpoint_status.copy())
                         print(f'Tatotalk 已连接（{connection.host}:{connection.port}）；'
                               '独立采集和 HTTP 队列正在运行。', flush=True)
-                        delay, next_ping, next_recovery = 1, time.monotonic() + 25, 0
-                        next_dialogs, channel_due = 0, {}
-                        while not stop.is_set():
-                            if time.monotonic() >= next_dialogs:
-                                try:
-                                    await refresh_dialogs(connection, processor, state)
-                                except (ValueError, TLDecodeError):
-                                    state['dialogs_error'] = 'dialog_baseline_unavailable'
-                                next_dialogs = time.monotonic() + 300
-                            if time.monotonic() >= next_recovery:
-                                await recover_global(connection, processor, state)
-                                next_recovery = time.monotonic() + 30
-                            cursor = store.get_checkpoint()
-                            for channel in cursor.get('channels', {}):
-                                if time.monotonic() >= channel_due.get(channel, 0):
-                                    timeout = await recover_channel_safely(connection, processor, int(channel), state)
-                                    channel_due[channel] = time.monotonic() + timeout
-                                    processor.replay()
-                                    if stop.is_set():
-                                        break
-                            try:
-                                update = await asyncio.wait_for(queue.get(), 0.5)
-                            except asyncio.TimeoutError:
-                                update = None
-                            if isinstance(update, RawTatoUpdates):
-                                packet_id = getattr(update, 'sample_path', None) or store.put_wire(update.raw)
-                                if packet_id not in processor.attempted:
-                                    processor.process(packet_id, update.raw)
-                                if 'global' in processor.gaps:
-                                    next_recovery = min(next_recovery, time.monotonic() + 1)
-                                for gap in processor.gaps:
-                                    if gap.startswith('channel:'):
-                                        channel_due[gap.split(':')[1]] = 0
-                            connection.check_connected()
-                            if time.monotonic() >= next_ping:
-                                await asyncio.wait_for(connection.sender.send(PingRequest(1)), 10)
-                                next_ping = time.monotonic() + 25
+                        delay = 1
+                        await run_connected(connection, queue, store, processor, state, stop,
+                            health_interval=getattr(args, 'health_interval', 30),
+                            health_timeout=getattr(args, 'health_timeout', 10))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -393,7 +452,7 @@ async def run(args):
                 log = WireLog(args.samples)
                 for path in sorted(args.samples.glob('*.dpapi')):
                     store.put_wire(log.read(path))
-            processor.replay()
+            await processor.replay_async()
             tasks.append(asyncio.create_task(delivery_loop(store, args.config, state, stop, filters)))
             if not args.drain_only:
                 tasks.append(asyncio.create_task(connection_loop(args, store, processor, state, stop)))
@@ -436,6 +495,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=int, default=0, help='0 means run until stopped')
     parser.add_argument('--drain-only', action='store_true', help='Send saved events without connecting to Tatotalk')
+    parser.add_argument('--health-interval', type=float, default=30,
+                        help='Seconds between independent business health checks (1..3600)')
+    parser.add_argument('--health-timeout', type=float, default=10,
+                        help='Seconds before a health check forces reconnect (1..60)')
     parser.add_argument('--session', type=Path, default=Path('sessions/default.dpapi'))
     parser.add_argument('--profile', type=Path, default=Path('config/client-profile.local.json'))
     parser.add_argument('--public-key', type=Path, default=Path('research/android-static/embedded-public-0.pem'))
@@ -449,6 +512,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.seconds < 0:
         parser.error('seconds must not be negative')
+    if not math.isfinite(args.health_interval) or not 1 <= args.health_interval <= 3600:
+        parser.error('health-interval must be finite and between 1 and 3600')
+    if not math.isfinite(args.health_timeout) or not 1 <= args.health_timeout <= 60:
+        parser.error('health-timeout must be finite and between 1 and 60')
     try:
         result = asyncio.run(run(args))
     except KeyboardInterrupt:

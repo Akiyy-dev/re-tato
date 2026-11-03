@@ -55,6 +55,22 @@ Copy-Item config/client-profile.example.json config/client-profile.local.json
 
 当前自动发现仅支持公网 IPv4 TCP；原版只连接本地代理或使用不兼容的隧道时，连接表中的地址可能无法直接使用，程序会继续尝试公共配置。所有可用来源均无法访问时仍需恢复网络；不会扫描网段或信任网络下发的新公钥。
 
+## 定时检查连接
+
+连接建立后立即执行一次只读业务检查，之后默认每 30 秒检查，10 秒未响应就关闭旧连接并进入自动节点发现和重连。业务检查验证 `updates.getState` 的回复，不仅查看本机 socket 标志，也不会推进消息同步游标。失败节点会短暂冷却，让重连有机会使用其它地址。
+
+实时消息处理、差量补拉和健康检查独立运行，长时间补拉不会再把实时消息和检查排在后面。旧补拉回复不会清掉期间新发现的同步缺口。安静的会话不算故障，不会仅因为没有新消息就重新连接。
+
+`show-status.cmd` 的 `health_check` 显示 `status`、`last_checked_at`、`last_success_at`、`last_latency_ms`、`checks`、`failures` 和固定原因的 `last_error`；检查失败时 `connected` 会变为 `false`。健康表示业务请求能往返，消息解码和 HTTP 投递仍分别查看原有错误及队列状态。
+
+需要调整频率时，可在 PowerShell 运行，例如每 60 秒检查、15 秒超时：
+
+```powershell
+.\run-collector.cmd --health-interval 60 --health-timeout 15
+```
+
+检查间隔支持 1 至 3600 秒，超时支持 1 至 60 秒。更新后重启采集器即可生效，保留已有会话、配置和消息队列。
+
 ## 接收与投递
 
 - 接收私聊、普通群、超级群和频道更新，包括服务端同步给独立会话的已发送消息。首次启动建立当前进度，默认不批量推送旧历史。
